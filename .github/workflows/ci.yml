@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  validate:
+    name: Validate config
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Bat loi cu phap / thieu volume / trung ten port ngay tu day,
+      # thay vi den luc `docker compose up` tren may ai do moi vo.
+      - name: Validate docker-compose.yml
+        run: docker compose config --quiet
+
+      - name: Validate prometheus.yml
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}/prometheus:/cfg:ro" \
+            --entrypoint promtool \
+            prom/prometheus:latest check config /cfg/prometheus.yml
+
+      - name: Validate YAML provisioning cua Grafana
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY'
+          import pathlib, sys, yaml
+          root = pathlib.Path("grafana")
+          files = sorted(p for p in root.rglob("*") if p.suffix in (".yml", ".yaml"))
+          if not files:
+              print("Khong co file YAML nao trong grafana/ -> bo qua.")
+              sys.exit(0)
+          bad = 0
+          for f in files:
+              try:
+                  yaml.safe_load(f.read_text())
+                  print(f"OK   {f}")
+              except yaml.YAMLError as e:
+                  bad += 1
+                  print(f"FAIL {f}\n     {e}")
+          sys.exit(1 if bad else 0)
+          PY
+
+  smoke:
+    name: Smoke test (MySQL + Redis that su chay len duoc)
+    runs-on: ubuntu-latest
+    needs: validate
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Chi bat MySQL + Redis: day la 2 dich vu app phu thuoc truc tiep.
+      # Prometheus/Grafana/MinIO chi can validate cau hinh la du.
+      - name: Khoi dong MySQL + Redis
+        run: docker compose up -d mysql redis
+
+      - name: Cho MySQL bao healthy (toi da 120s)
+        run: |
+          for i in $(seq 1 60); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' dididi-mysql 2>/dev/null || echo starting)
+            echo "[$i] mysql: $status"
+            [ "$status" = "healthy" ] && exit 0
+            sleep 2
+          done
+          echo "MySQL khong healthy sau 120s"
+          docker compose logs mysql
+          exit 1
+
+      - name: Redis tra loi PONG
+        run: docker compose exec -T redis redis-cli ping | grep -q PONG
+
+      # init/01-init.sql chay tu dong lan dau khoi tao volume.
+      # Day moi la phan dang kiem: script hong thi ca 3 app deu khong ket noi duoc DB.
+      - name: init/01-init.sql tao du 3 database
+        run: |
+          docker compose exec -T mysql \
+            mysql -uroot -proot_dev_pass -N -e "SHOW DATABASES;" > /tmp/dbs.txt
+          cat /tmp/dbs.txt
+          for db in booking flight_provider hotel_pms; do
+            grep -qx "$db" /tmp/dbs.txt || { echo "THIEU database: $db"; exit 1; }
+          done
+
+      # Cap quyen sai thi app van bao "Access denied" du database ton tai -> kiem luon.
+      - name: User `booking` dang nhap va ghi duoc
+        run: |
+          docker compose exec -T mysql mysql -ubooking -pbooking_dev_pass booking \
+            -e "CREATE TABLE ci_probe (id INT); DROP TABLE ci_probe;"
+
+      - name: Log khi that bai
+        if: failure()
+        run: docker compose logs
+
+      - name: Don dep
+        if: always()
+        run: docker compose down -v
